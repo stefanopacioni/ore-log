@@ -394,7 +394,9 @@ async function jbUpdate(key, binId, data) {
     body: JSON.stringify(payload)
   });
   if (!res.ok) { const t=await res.text(); throw new Error(`Salvataggio fallito (${res.status}): ${t}`); }
+  /* Aggiorna i timestamp SOLO dopo conferma dal server */
   setRemoteTs(payload.saved_at);
+  localStorage.setItem('jb_local_ts', String(payload.saved_at));
   return res.json();
 }
 
@@ -448,28 +450,36 @@ async function startupSync() {
   if (!key||!binId) { hideSplash(); return; }
   setSplash('Connessione al cloud…'); setSyncDots('syncing');
   try {
-    const remote = await jbRead(key, binId);
+    const remote   = await jbRead(key, binId);
     const remoteTs = remote.saved_at || 0;
     const localTs  = getLocalTs();
+    const local    = getData();
 
-    if (remoteTs > localTs) {
+    // Sicurezza: non sovrascrivere locale se il remoto ha meno voci
+    // (protegge dal refresh fatto prima che il salvataggio cloud finisse)
+    const remoteIsNewer = remoteTs > localTs;
+    const remoteSafer   = remote.entries.length >= local.length;
+
+    if (remoteIsNewer && remoteSafer) {
       setSplash(`Importo ${remote.entries.length} voci dal cloud…`);
       localStorage.setItem('ore_entries', JSON.stringify(remote.entries));
-      setRemoteTs(remoteTs); touchLocalTs();
+      setRemoteTs(remoteTs);
+      localStorage.setItem('jb_local_ts', String(remoteTs));
       const ts=setLastSync(); setSyncDots('ok');
       setLog(`✓ Dati aggiornati dal cloud — ${ts}`);
       showStartupBadge(`Sincronizzati ${remote.entries.length} record dal cloud`);
-    } else if (localTs > remoteTs) {
+    } else if (local.length > 0 && (!remoteIsNewer || !remoteSafer)) {
       setSplash('Aggiorno cloud con dati locali…');
-      await jbUpdate(key, binId, getData());
+      await jbUpdate(key, binId, local);
       const ts=setLastSync(); setSyncDots('ok');
-      setLog(`✓ Cloud aggiornato — ${ts}`);
+      setLog(`✓ Cloud aggiornato con dati locali — ${ts}`);
       showStartupBadge('Cloud aggiornato con dati locali');
     } else {
       setSyncDots('ok'); setLog(`✓ Già sincronizzato — ${getLastSync()||'ora'}`);
       showStartupBadge('Dati già sincronizzati');
     }
   } catch(err) {
+    // Errore di rete: non toccare mai i dati locali
     setSyncDots('error'); setLog(`✗ Sync avvio: ${err.message}`);
   }
   hideSplash(); renderAll();
@@ -482,7 +492,7 @@ function showStartupBadge(msg) {
 
 /* ══ SYNC ══ */
 function scheduleSync() {
-  touchLocalTs();
+  /* NON aggiornare localTs qui — viene aggiornato solo dopo conferma dal server in jbUpdate */
   if (!getKey()||!getBinId()) return;
   if (syncTimer) clearTimeout(syncTimer);
   setSyncDots('syncing');
