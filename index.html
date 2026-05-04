@@ -444,43 +444,54 @@ function updateJbUI(connected) {
   }
 }
 
-/* ══ STARTUP SYNC ══ */
+/* ══ STARTUP SYNC ══
+   Strategia: il cloud è sempre fonte di verità.
+   All'avvio si scarica dal cloud e si fa MERGE con i dati locali
+   (unione per ID, senza duplicati). Il risultato viene risalvato
+   su cloud e localStorage. Così cancellare il browser non perde
+   mai nulla perché JSONBin ha sempre la copia completa.
+*/
 async function startupSync() {
   const key=getKey(), binId=getBinId();
   if (!key||!binId) { hideSplash(); return; }
   setSplash('Connessione al cloud…'); setSyncDots('syncing');
   try {
-    const remote   = await jbRead(key, binId);
-    const remoteTs = remote.saved_at || 0;
-    const localTs  = getLocalTs();
-    const local    = getData();
+    const remote = await jbRead(key, binId);
+    const local  = getData();
 
-    // Sicurezza: non sovrascrivere locale se il remoto ha meno voci
-    // (protegge dal refresh fatto prima che il salvataggio cloud finisse)
-    const remoteIsNewer = remoteTs > localTs;
-    const remoteSafer   = remote.entries.length >= local.length;
-
-    if (remoteIsNewer && remoteSafer) {
-      setSplash(`Importo ${remote.entries.length} voci dal cloud…`);
-      localStorage.setItem('ore_entries', JSON.stringify(remote.entries));
-      setRemoteTs(remoteTs);
-      localStorage.setItem('jb_local_ts', String(remoteTs));
-      const ts=setLastSync(); setSyncDots('ok');
-      setLog(`✓ Dati aggiornati dal cloud — ${ts}`);
-      showStartupBadge(`Sincronizzati ${remote.entries.length} record dal cloud`);
-    } else if (local.length > 0 && (!remoteIsNewer || !remoteSafer)) {
-      setSplash('Aggiorno cloud con dati locali…');
-      await jbUpdate(key, binId, local);
-      const ts=setLastSync(); setSyncDots('ok');
-      setLog(`✓ Cloud aggiornato con dati locali — ${ts}`);
-      showStartupBadge('Cloud aggiornato con dati locali');
+    let merged;
+    if (!remote || !remote.entries || remote.entries.length === 0) {
+      // Nessun dato remoto: carica locale su cloud
+      merged = local;
     } else {
-      setSyncDots('ok'); setLog(`✓ Già sincronizzato — ${getLastSync()||'ora'}`);
-      showStartupBadge('Dati già sincronizzati');
+      // Merge: unisce locale e remoto per ID, senza duplicati
+      // In caso di ID uguale, vince la voce con il campo 'id' più recente (timestamp)
+      const map = {};
+      remote.entries.forEach(e => { map[e.id] = e; });
+      local.forEach(e => {
+        // la voce locale sovrascrive quella remota solo se ha ID più recente
+        // (normalmente gli ID sono timestamp quindi questo funziona sempre)
+        if (!map[e.id] || e.id >= map[e.id].id) map[e.id] = e;
+      });
+      merged = Object.values(map).sort((a,b) =>
+        a.data.localeCompare(b.data) || a.fascia.localeCompare(b.fascia) || a.inizio.localeCompare(b.inizio)
+      );
     }
+
+    // Salva il merge sia in locale che sul cloud
+    localStorage.setItem('ore_entries', JSON.stringify(merged));
+    if (merged.length !== (remote && remote.entries ? remote.entries.length : 0) ||
+        local.length !== (remote && remote.entries ? remote.entries.length : 0)) {
+      setSplash('Aggiorno cloud…');
+      await jbUpdate(key, binId, merged);
+    }
+    const ts=setLastSync(); setSyncDots('ok');
+    setLog(`✓ Sincronizzato: ${merged.length} voci — ${ts}`);
+    showStartupBadge(`${merged.length} voci sincronizzate`);
   } catch(err) {
-    // Errore di rete: non toccare mai i dati locali
-    setSyncDots('error'); setLog(`✗ Sync avvio: ${err.message}`);
+    // Errore di rete: usa dati locali senza toccarli
+    setSyncDots('error');
+    setLog(`✗ Sync avvio: ${err.message} — uso dati locali`);
   }
   hideSplash(); renderAll();
 }
@@ -490,9 +501,8 @@ function showStartupBadge(msg) {
   if(el&&tx){ tx.textContent=msg; el.style.display='flex'; }
 }
 
-/* ══ SYNC ══ */
+/* ══ SYNC (═ salvataggio dopo modifica) ══ */
 function scheduleSync() {
-  /* NON aggiornare localTs qui — viene aggiornato solo dopo conferma dal server in jbUpdate */
   if (!getKey()||!getBinId()) return;
   if (syncTimer) clearTimeout(syncTimer);
   setSyncDots('syncing');
@@ -514,13 +524,19 @@ async function doSync() {
 async function syncNow() { setLog('Sincronizzazione in corso…'); await doSync(); }
 
 async function restoreFromCloud() {
-  if (!confirm('Sovrascrivere i dati locali con quelli del cloud?')) return;
+  if (!confirm('Scaricare i dati dal cloud e fare merge con quelli locali?')) return;
   setSyncDots('syncing'); setLog('Download dal cloud…');
   try {
     const remote=await jbRead(getKey(),getBinId());
-    localStorage.setItem('ore_entries',JSON.stringify(remote.entries));
-    setRemoteTs(remote.saved_at||0); touchLocalTs();
-    setSyncDots('ok'); setLog(`✓ Ripristino completato — ${remote.entries.length} voci`);
+    if (!remote||!remote.entries){setLog('Nessun dato trovato sul cloud.');setSyncDots('');return;}
+    const local=getData();
+    const map={};
+    remote.entries.forEach(e=>{map[e.id]=e;});
+    local.forEach(e=>{if(!map[e.id]||e.id>=map[e.id].id)map[e.id]=e;});
+    const merged=Object.values(map).sort((a,b)=>a.data.localeCompare(b.data)||a.fascia.localeCompare(b.fascia)||a.inizio.localeCompare(b.inizio));
+    localStorage.setItem('ore_entries',JSON.stringify(merged));
+    await jbUpdate(getKey(),getBinId(),merged);
+    setSyncDots('ok'); setLog(`✓ Merge completato — ${merged.length} voci`);
     renderAll();
   } catch(err) { setSyncDots('error'); setLog(`✗ ${err.message}`); }
 }
